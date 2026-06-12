@@ -34,6 +34,9 @@ load_dotenv(".env.local")
 
 STUDENT_ID = os.environ.get("STUDENT_ID", "B22DCVT028")  # <-- ĐỔI MÃ SV TẠI ĐÂY
 TEACHER_BASE = os.environ.get("TEACHER_BASE", "http://192.168.50.218:8000/api/v1")
+LLM_BASE_URL = os.environ.get("BASE_URL", f"{TEACHER_BASE}/proxy")
+LLM_API_KEY = os.environ.get("API_KEY", STUDENT_ID)
+MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
@@ -60,8 +63,8 @@ reranker = CrossEncoder("itdainb/PhoRanker", max_length=256)
 logger.info("Reranker model loaded!")
 
 llm_client = OpenAI(
-    base_url=f"{TEACHER_BASE}/proxy",
-    api_key=STUDENT_ID,
+    base_url=LLM_BASE_URL,
+    api_key=LLM_API_KEY,
 )
 
 
@@ -315,7 +318,7 @@ async def ask(req: AskRequest):
     # 3. Call proxy LLM
     try:
         response = llm_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL_NAME,
             messages=[
                 {
                     "role": "system",
@@ -349,7 +352,19 @@ def extract_answer(raw: str) -> str:
     # Thử match trực tiếp
     if raw in ("A", "B", "C", "D"):
         return raw
-    # Tìm trong chuỗi
+
+    # Bắt các dạng phổ biến: "Đáp án: B", "Answer is B", "(B)", "B."
+    patterns = [
+        r"(?:ĐÁP\s*ÁN|DAP\s*AN|ANSWER|OPTION|CHỌN|CHON)\s*(?:LÀ|LA|IS|:)?\s*([ABCD])\b",
+        r"\b([ABCD])\s*[\.\)]",
+        r"\b([ABCD])\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw)
+        if match:
+            return match.group(1)
+
+    # Fallback cuối cùng nếu model vẫn trả kèm format lạ.
     match = re.search(r"[ABCD]", raw)
     if match:
         return match.group()
@@ -376,4 +391,5 @@ if __name__ == "__main__":
     logger.info(f"Starting Student Server on {SERVER_HOST}:{SERVER_PORT}")
     logger.info(f"   Student ID: {STUDENT_ID}")
     logger.info(f"   Teacher: {TEACHER_BASE}")
+    logger.info(f"   LLM: {MODEL_NAME} @ {LLM_BASE_URL}")
     uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")

@@ -16,6 +16,8 @@ import time
 import json
 import logging
 import threading
+from pathlib import Path
+import re
 
 import requests
 import uvicorn
@@ -29,6 +31,9 @@ load_dotenv(".env.local")
 
 TEACHER_HOST = "0.0.0.0"
 TEACHER_PORT = int(os.environ.get("TEACHER_PORT", "8000"))
+MOCK_QUESTIONS_PATH = os.environ.get("MOCK_QUESTIONS_PATH")
+MOCK_DOCUMENTS_PATH = os.environ.get("MOCK_DOCUMENTS_PATH")
+MOCK_QUESTION_LIMIT = int(os.environ.get("MOCK_QUESTION_LIMIT", "0"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("mock_teacher")
@@ -171,6 +176,82 @@ Phần 10: RAG Application Evaluation
 Các framework đánh giá phổ biến: RAGAS, DeepEval, LangSmith.
 """
 
+
+def load_document_from_path(path: str) -> str:
+    """Load a mock document from TXT/MD/PDF for local evaluation."""
+    document_path = Path(path)
+    if not document_path.exists():
+        raise FileNotFoundError(f"MOCK_DOCUMENT_PATH not found: {document_path}")
+
+    if document_path.suffix.lower() == ".pdf":
+        import fitz
+
+        with fitz.open(document_path) as doc:
+            return "\n".join(page.get_text("text") for page in doc)
+
+    return document_path.read_text(encoding="utf-8", errors="ignore")
+
+
+if os.environ.get("MOCK_DOCUMENT_PATH"):
+    DOCUMENT_TEXT = load_document_from_path(os.environ["MOCK_DOCUMENT_PATH"])
+    logger.info(
+        f"Loaded mock document from {os.environ['MOCK_DOCUMENT_PATH']} | "
+        f"text_len={len(DOCUMENT_TEXT)}"
+    )
+
+
+def extract_correct_letter(answer: str) -> str:
+    """Extract the A/B/C/D key from an answer string like 'B. ...'."""
+    match = re.match(r"\s*([ABCD])\s*[\.\)]?", answer.strip(), re.IGNORECASE)
+    return match.group(1).upper() if match else "A"
+
+
+def format_question_payload(item: dict) -> str:
+    """Build the /ask question text from a JSON question item."""
+    options = item.get("options", [])
+    if isinstance(options, list):
+        options_text = "\n".join(str(option) for option in options)
+    else:
+        options_text = str(options)
+    return f"{item.get('question', '')}\n{options_text}".strip()
+
+
+def load_documents_json(path: str) -> str:
+    """Load legal_documents.json into one document string for /upload."""
+    docs = json.loads(Path(path).read_text(encoding="utf-8"))
+    parts = []
+    for doc in docs:
+        doc_id = doc.get("id", "")
+        text = doc.get("text", "")
+        parts.append(f"[{doc_id}]\n{text}")
+    return "\n\n---\n\n".join(parts)
+
+
+def load_questions_json(path: str) -> list[dict]:
+    """Load question.json into mock teacher question records."""
+    rows = json.loads(Path(path).read_text(encoding="utf-8"))
+    if MOCK_QUESTION_LIMIT > 0:
+        rows = rows[:MOCK_QUESTION_LIMIT]
+    questions = []
+    for row in rows:
+        questions.append(
+            {
+                "id": row.get("id"),
+                "question": format_question_payload(row),
+                "correct": extract_correct_letter(str(row.get("answer", ""))),
+                "answer_text": row.get("answer", ""),
+            }
+        )
+    return questions
+
+
+if MOCK_DOCUMENTS_PATH:
+    DOCUMENT_TEXT = load_documents_json(MOCK_DOCUMENTS_PATH)
+    logger.info(
+        f"Loaded mock documents from {MOCK_DOCUMENTS_PATH} | "
+        f"text_len={len(DOCUMENT_TEXT)}"
+    )
+
 # ============================================================
 # 10 CÂU HỎI - dài, gây nhiễu, đáp án dài
 # ============================================================
@@ -297,6 +378,13 @@ QUESTIONS = [
     },
 ]
 
+if MOCK_QUESTIONS_PATH:
+    QUESTIONS = load_questions_json(MOCK_QUESTIONS_PATH)
+    logger.info(
+        f"Loaded mock questions from {MOCK_QUESTIONS_PATH} | "
+        f"questions={len(QUESTIONS)}"
+    )
+
 # ============================================================
 # STATE
 # ============================================================
@@ -385,10 +473,11 @@ def _run_evaluation(student_id: str, document_received: bool = False):
             student["detail"].append({"upload_error": str(e)})
             return
 
-    # Step 2: Ask 10 questions
+    # Step 2: Ask questions
+    total_questions = len(QUESTIONS)
     for i, q in enumerate(QUESTIONS):
         student["current_question"] = i + 1
-        logger.info(f"[EVAL] Câu {i+1}/10: {q['question'][:60]}...")
+        logger.info(f"[EVAL] Câu {i+1}/{total_questions}: {q['question'][:60]}...")
 
         try:
             resp = requests.post(
@@ -428,7 +517,7 @@ def _run_evaluation(student_id: str, document_received: bool = False):
 
     student["status"] = "completed"
     logger.info(
-        f"[EVAL] Hoàn thành! {student_id}: {student['score']}/{len(QUESTIONS)} điểm"
+        f"[EVAL] Hoàn thành! {student_id}: {student['score']}/{total_questions} điểm"
     )
 
 

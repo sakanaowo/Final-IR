@@ -10,20 +10,28 @@ import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+from pathlib import Path
 import re
 import logging
+import threading
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
+from sentence_transformers.cross_encoder import CrossEncoder
 from openai import OpenAI
 import uvicorn
 
 # ============================================================
 # CONFIG
 # ============================================================
+from dotenv import load_dotenv
+
+load_dotenv(".env.local")
+
 STUDENT_ID = os.environ.get("STUDENT_ID", "B22DCVT028")  # <-- ĐỔI MÃ SV TẠI ĐÂY
 TEACHER_BASE = os.environ.get("TEACHER_BASE", "http://192.168.50.218:8000/api/v1")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
@@ -31,6 +39,9 @@ SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "512"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "64"))
 TOP_K = int(os.environ.get("TOP_K", "5"))
+RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "15"))  # Retrieve nhiều hơn rồi rerank
+VECTOR_DB_PATH = Path(os.environ.get("VECTOR_DB_PATH", "vector_store.npz"))
+QUESTION_LOG_PATH = Path(os.environ.get("QUESTION_LOG_PATH", "teacher_questions.md"))
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
@@ -43,6 +54,10 @@ logger = logging.getLogger(__name__)
 logger.info("Loading embedding model...")
 embed_model = SentenceTransformer("keepitreal/vietnamese-sbert")
 logger.info("Embedding model loaded!")
+
+logger.info("Loading reranker model...")
+reranker = CrossEncoder("itdainb/PhoRanker", max_length=256)
+logger.info("Reranker model loaded!")
 
 llm_client = OpenAI(
     base_url=f"{TEACHER_BASE}/proxy",
@@ -76,16 +91,112 @@ class VectorStore:
         else:
             self.embeddings = np.vstack([self.embeddings, new_embeddings])
 
+    def save(self, path: Path = VECTOR_DB_PATH):
+        if self.embeddings is None or not self.chunks:
+            logger.warning("Skip saving empty vector store")
+            return
+        np.savez_compressed(
+            path,
+            chunks=np.array(self.chunks, dtype=object),
+            embeddings=self.embeddings,
+        )
+        logger.info(f"Saved vector store to {path} | chunks={len(self.chunks)}")
+
+    def load(self, path: Path = VECTOR_DB_PATH) -> bool:
+        if not path.exists():
+            logger.info(f"No persisted vector store found at {path}")
+            return False
+        try:
+            data = np.load(path, allow_pickle=True)
+            chunks = data["chunks"].tolist()
+            embeddings = data["embeddings"]
+        except Exception as e:
+            logger.error(f"Failed to load vector store from {path}: {e}")
+            return False
+
+        if not chunks or embeddings is None or len(chunks) != len(embeddings):
+            logger.error(f"Invalid vector store at {path}")
+            return False
+
+        self.chunks = list(chunks)
+        self.embeddings = np.array(embeddings)
+        logger.info(f"Loaded vector store from {path} | chunks={len(self.chunks)}")
+        return True
+
     def search(self, query: str, top_k: int = TOP_K) -> list[str]:
         if self.embeddings is None or len(self.chunks) == 0:
             return []
         q_emb = embed_model.encode([query], normalize_embeddings=True)
         scores = np.dot(self.embeddings, q_emb.T).flatten()
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        return [self.chunks[i] for i in top_indices]
+
+        # Lấy nhiều candidates hơn rồi rerank
+        n_candidates = min(RERANK_CANDIDATES, len(self.chunks))
+        candidate_indices = np.argsort(scores)[::-1][:n_candidates]
+        candidates = [self.chunks[i] for i in candidate_indices]
+
+        # Rerank bằng cross-encoder
+        if len(candidates) > top_k:
+            pairs = [(query, doc) for doc in candidates]
+            rerank_scores = reranker.predict(pairs)
+            reranked_indices = np.argsort(rerank_scores)[::-1][:top_k]
+            return [candidates[i] for i in reranked_indices]
+
+        return candidates[:top_k]
 
 
 store = VectorStore()
+store.load()
+
+
+# ============================================================
+# QUESTION LOGGING
+# ============================================================
+question_counter = 0
+question_log_lock = threading.Lock()
+
+
+def append_question_log(question: str) -> int:
+    """Append the raw teacher question to a markdown log file."""
+    global question_counter
+    with question_log_lock:
+        question_counter += 1
+        question_num = question_counter
+
+        QUESTION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not QUESTION_LOG_PATH.exists():
+            QUESTION_LOG_PATH.write_text("# Teacher Questions\n\n", encoding="utf-8")
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = [
+            f"## Question {question_num}",
+            "",
+            "- Local answer: pending",
+            f"- Time: {timestamp}",
+            "",
+            "```text",
+            question.strip(),
+            "```",
+            "",
+        ]
+        with QUESTION_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write("\n".join(entry) + "\n")
+        return question_num
+
+
+def rewrite_question_answer(question_num: int, answer: str):
+    """Update the final local answer for one logged question."""
+    if not QUESTION_LOG_PATH.exists():
+        return
+    with question_log_lock:
+        text = QUESTION_LOG_PATH.read_text(encoding="utf-8")
+        marker = f"## Question {question_num}\n\n"
+        idx = text.find(marker)
+        if idx == -1:
+            return
+        old = marker + "- Local answer: pending"
+        new = marker + f"- Local answer: {answer}"
+        text = text.replace(old, new, 1)
+        QUESTION_LOG_PATH.write_text(text, encoding="utf-8")
 
 
 # ============================================================
@@ -146,7 +257,7 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
-    sources: list[str] = []
+    sources: list[str] = Field(default_factory=list)
 
 
 # --- Endpoints ---
@@ -159,6 +270,7 @@ async def upload(req: UploadRequest):
     store.clear()
     text_chunks = chunk_text(req.text)
     store.add(text_chunks)
+    store.save()
 
     logger.info(f"Indexed {len(text_chunks)} chunks")
     return UploadResponse(
@@ -172,6 +284,14 @@ async def upload(req: UploadRequest):
 async def ask(req: AskRequest):
     """Nhận câu hỏi, retrieve context, gọi LLM proxy, trả answer A/B/C/D."""
     logger.info(f"/ask received | question={req.question[:80]}...")
+    question_num = None
+    try:
+        question_num = append_question_log(req.question)
+    except Exception as e:
+        logger.error(f"Question log error: {e}")
+
+    if store.embeddings is None or not store.chunks:
+        store.load()
 
     # 1. Retrieve relevant chunks
     relevant = store.search(req.question, top_k=TOP_K)
@@ -213,6 +333,11 @@ async def ask(req: AskRequest):
 
     # 4. Extract single letter A/B/C/D
     answer = extract_answer(raw_answer)
+    if question_num is not None:
+        try:
+            rewrite_question_answer(question_num, answer)
+        except Exception as e:
+            logger.error(f"Question answer log error: {e}")
     logger.info(f"Answer: {answer} (raw: {raw_answer})")
 
     return AskResponse(answer=answer, sources=relevant[:3])
@@ -233,7 +358,15 @@ def extract_answer(raw: str) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "student_id": STUDENT_ID}
+    return {
+        "status": "ok",
+        "student_id": STUDENT_ID,
+        "chunks": len(store.chunks),
+        "vector_db_path": str(VECTOR_DB_PATH),
+        "vector_db_exists": VECTOR_DB_PATH.exists(),
+        "question_log_path": str(QUESTION_LOG_PATH),
+        "questions_logged": question_counter,
+    }
 
 
 # ============================================================

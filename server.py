@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
+import torch
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
@@ -45,21 +46,56 @@ TOP_K = int(os.environ.get("TOP_K", "5"))
 RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "15"))  # Retrieve nhiều hơn rồi rerank
 VECTOR_DB_PATH = Path(os.environ.get("VECTOR_DB_PATH", "vector_store.npz"))
 QUESTION_LOG_PATH = Path(os.environ.get("QUESTION_LOG_PATH", "teacher_questions.md"))
+MODEL_DEVICE = os.environ.get("MODEL_DEVICE") or os.environ.get("DEVICE")
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+
+def resolve_model_device() -> str:
+    """Choose the torch device for sentence-transformers models."""
+    requested_device = (MODEL_DEVICE or "auto").strip().lower()
+    if requested_device not in ("", "auto"):
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            logger.warning(
+                "MODEL_DEVICE=cuda was requested, but torch cannot see CUDA. "
+                "Falling back to CPU. Check that the CUDA-enabled torch wheel is installed."
+            )
+            return "cpu"
+        return requested_device
+
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+DEVICE = resolve_model_device()
+if DEVICE == "cuda":
+    logger.info(
+        "Torch device: cuda | torch=%s | cuda=%s | gpu=%s",
+        torch.__version__,
+        torch.version.cuda,
+        torch.cuda.get_device_name(0),
+    )
+else:
+    logger.info(
+        "Torch device: cpu | torch=%s | cuda_available=%s | cuda_build=%s",
+        torch.__version__,
+        torch.cuda.is_available(),
+        torch.version.cuda,
+    )
+
 # ============================================================
 # MODELS
 # ============================================================
 logger.info("Loading embedding model...")
-embed_model = SentenceTransformer("keepitreal/vietnamese-sbert")
+embed_model = SentenceTransformer("keepitreal/vietnamese-sbert", device=DEVICE)
 logger.info("Embedding model loaded!")
 
 logger.info("Loading reranker model...")
-reranker = CrossEncoder("itdainb/PhoRanker", max_length=256)
+reranker = CrossEncoder("itdainb/PhoRanker", max_length=256, device=DEVICE)
 logger.info("Reranker model loaded!")
 
 llm_client = OpenAI(
@@ -381,6 +417,11 @@ async def health():
         "vector_db_exists": VECTOR_DB_PATH.exists(),
         "question_log_path": str(QUESTION_LOG_PATH),
         "questions_logged": question_counter,
+        "model_device": DEVICE,
+        "torch_version": torch.__version__,
+        "torch_cuda_available": torch.cuda.is_available(),
+        "torch_cuda_build": torch.version.cuda,
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     }
 
 
